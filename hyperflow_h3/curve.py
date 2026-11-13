@@ -15,10 +15,11 @@ import folder_paths
 from comfy.patcher_extension import WrappersMP
 from .embedder import (time_pairs, make_block_forward, make_final_forward,
                                    make_ctx_wrapper, _unwrap_two_time)
-from .schedule import video_schedule_sigmas
+from .schedule import is_trained_tail, video_schedule_sigmas
 
 _log = logging.getLogger("comfy.hyperflow")
 FIT_DIRECTORY = Path(__file__).resolve().parents[1] / "assets" / "curve_fits"
+HASH_CACHE_FILE = FIT_DIRECTORY / ".sha256_cache.json"
 _hashes = {}
 
 
@@ -31,8 +32,27 @@ def file_hash(path):
     stat = os.stat(path)
     key = (str(path), stat.st_size, stat.st_mtime_ns)
     if key not in _hashes:
-        with open(path, "rb") as handle:
-            _hashes[key] = hashlib.file_digest(handle, "sha256").hexdigest()
+        disk_key = f"{Path(path).resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
+        disk_cache = {}
+        if stat.st_size >= 1024 * 1024 and HASH_CACHE_FILE.is_file():
+            try:
+                disk_cache = json.loads(HASH_CACHE_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                disk_cache = {}
+        cached = disk_cache.get(disk_key)
+        if isinstance(cached, str) and len(cached) == 64:
+            _hashes[key] = cached
+        else:
+            with open(path, "rb") as handle:
+                digest = hashlib.file_digest(handle, "sha256").hexdigest()
+            _hashes[key] = digest
+            if stat.st_size >= 1024 * 1024:
+                try:
+                    HASH_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                    disk_cache[disk_key] = digest
+                    HASH_CACHE_FILE.write_text(json.dumps(disk_cache, indent=2), encoding="utf-8")
+                except OSError:
+                    pass
     return _hashes[key]
 
 
@@ -139,6 +159,9 @@ def install_curve_refit(model, fit, verbose=False):
     grid = video_schedule_sigmas(json.loads(meta["sigmas"]))
     projections = len(dm.blocks) + 1  # blocks, then the final layer
     generated, pinned = data["generated"].reshape(-1, 16, 8), data["pinned"].reshape(-1, 1025, 8)
+    pairs = list(zip(data["t"].tolist(), data["r"].tolist()))
+    pairs_v, pairs_a = pairs[:8], pairs[8:]
+    dev_cache = {}
     warned = False
 
     def warn():
@@ -149,16 +172,34 @@ def install_curve_refit(model, fit, verbose=False):
 
     def embed(t_vals):
         ctx = shared["ctx"]
-        table = comfy.model_management.cast_to(dm.adaln_t_table, device=t_vals.device)
+        dev = t_vals.device
+        table = comfy.model_management.cast_to(dm.adaln_t_table, device=dev)
         if not ctx["curve_active"]:
             out = table_lookup(table, t_vals)[None]
         else:
             t, r = time_pairs(t_vals, shared)
-            out = table_lookup(pinned.to(t_vals.device), t)
+            cached = dev_cache.get(dev)
+            if cached is None:
+                cached = (pinned.to(dev), generated.to(dev))
+                dev_cache[dev] = cached
+            pinned_dev, generated_dev = cached
+            out = table_lookup(pinned_dev, t)
             # A pair is either one of the 16 trained intervals or pinned (t,t).
-            for i, (pt, pr) in enumerate(zip(data["t"].tolist(), data["r"].tolist())):
-                take = ((t - pt).abs() < 1e-6) & ((r - pr).abs() < 1e-6) & (t != r)
-                out[:, take] = generated[:, i, None].to(out.device)
+            row_pairs = ctx.get("pairs")
+            if row_pairs is None:
+                row_pairs = list(zip(t.tolist(), r.tolist()))
+            row_idx, fit_idx = [], []
+            for r_i, (tv, rv) in enumerate(row_pairs):
+                if tv != rv:
+                    matched = None
+                    for f_i, (pt, pr) in enumerate(pairs):
+                        if abs(tv - pt) < 1e-6 and abs(rv - pr) < 1e-6:
+                            matched = f_i
+                    if matched is not None:
+                        row_idx.append(r_i)
+                        fit_idx.append(matched)
+            if row_idx:
+                out[:, row_idx] = generated_dev[:, fit_idx]
         # Native non-curve dispatch casts to compute dtype; consumers below
         # retain the original fp32 curve coordinates, as native curves do.
         ctx["curve_embedding"] = out.expand(projections, -1, -1)
@@ -179,8 +220,7 @@ def install_curve_refit(model, fit, verbose=False):
         options = args[3] if len(args) > 3 else kwargs.get("transformer_options", {})
         options = options or {}
         sigmas = options.get("sample_sigmas")
-        valid = (sigmas is not None and sigmas.shape == grid.shape
-                 and torch.equal(sigmas.cpu().float(), grid)
+        valid = (is_trained_tail(sigmas, grid)
                  and float(options.get("minimax_h3_sigma_shift_video", dm.sigma_shift_video)) == float(meta["video_shift"])
                  and float(options.get("minimax_h3_sigma_shift_audio", dm.sigma_shift_audio)) == float(meta["audio_shift"]))
         if not valid:
@@ -197,10 +237,9 @@ def install_curve_refit(model, fit, verbose=False):
             # samplers evaluating intermediate times must not consume this fit.
             pair_v = (ctx["t_v"], ctx["r_v"])
             pair_a = (ctx["t_a"], ctx["r_a"])
-            pairs = list(zip(data["t"].tolist(), data["r"].tolist()))
             def matches(pair, choices):
                 return any(abs(pair[0] - t) < 1e-6 and abs(pair[1] - r) < 1e-6 for t, r in choices)
-            ctx["curve_active"] = matches(pair_v, pairs[:8]) and matches(pair_a, pairs[8:])
+            ctx["curve_active"] = matches(pair_v, pairs_v) and matches(pair_a, pairs_a)
             if not ctx["curve_active"]:
                 warn()
             return executor(*inner_args, **inner_kwargs)

@@ -26,6 +26,13 @@ VIDEO_SHIFT = 12.0
 AUDIO_SHIFT = 3.0
 
 
+def is_trained_tail(sigmas, grid):
+    """A full schedule or its exact contiguous tail uses only fitted intervals."""
+    return (sigmas is not None and sigmas.ndim == 1
+            and 2 <= sigmas.numel() <= grid.numel()
+            and torch.equal(sigmas.cpu().float(), grid[-sigmas.numel():]))
+
+
 def validate_sigmas(sigmas: Sequence[float] | torch.Tensor) -> torch.Tensor:
     """Return ``sigmas`` as a float32 CPU tensor after checking it is a valid
     rectified-flow grid: strictly decreasing, starting at or below 1.0, ending at

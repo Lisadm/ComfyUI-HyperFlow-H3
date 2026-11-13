@@ -7,11 +7,14 @@ from pathlib import Path
 
 import comfy.model_management
 import comfy.utils
+import comfy.sd
 import folder_paths
 
 from .apply import apply_lora
+from .baked_curve import curve_for_checkpoint
+from .compact_lora import load_compact_lora
 from .compiler import install_compiler_workaround
-from .curve import matching_fit, install_curve_refit
+from .curve import fit_directories, install_curve_refit, matching_fit, read_fit
 from .curve_fit import fit_curve, fit_filename, parse_splice
 from .embedder import install_two_time
 from .schedule import validate_sigmas, video_schedule_sigmas
@@ -309,10 +312,78 @@ class HyperFlowH3CurveFit:
         return {"ui": {"text": [report]}, "result": (report,)}
 
 
+class CompactLoraLoaderModelOnly:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL",),
+            "lora_name": (folder_paths.get_filename_list("loras"),),
+            "strength_model": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01}),
+        }}
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "load"
+    CATEGORY = "model/loaders"
+
+    def load(self, model, lora_name, strength_model):
+        path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        weights = load_compact_lora(path)
+        result, _ = comfy.sd.load_lora_for_models(model, None, weights, strength_model, 0)
+        return (result,)
+
+
+class ApplyBakedH3Curve:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"model": ("MODEL",)}}
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply"
+    CATEGORY = "model/patches"
+
+    def apply(self, model):
+        if not model.cached_patcher_init:
+            raise ValueError("Load the baked diffusion checkpoint before restoring its curve")
+        source = model.cached_patcher_init[1][0]
+        path = curve_for_checkpoint(source, fit_directories())
+        result = model.clone()
+        install_curve_refit(result, read_fit(path))
+        install_compiler_workaround(result)
+        return (result,)
+
+
+class H3PresetSigmas:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "fallback": ("SIGMAS", {"lazy": True}),
+            "manual": ("STRING", {"forceInput": True}),
+        }}
+
+    RETURN_TYPES = ("SIGMAS",)
+    FUNCTION = "select"
+    CATEGORY = "model/sampling"
+
+    def check_lazy_status(self, fallback, manual):
+        return ["fallback"] if not (manual or "").strip() and fallback is None else []
+
+    def select(self, fallback, manual):
+        if not (manual or "").strip():
+            return (fallback,)
+        from comfy_extras.nodes_custom_sampler import ManualSigmas
+        return (ManualSigmas.execute(manual).result[0],)
+
+
 NODE_CLASS_MAPPINGS = {"ApplyHyperFlowH3": ApplyHyperFlowH3,
                        "ApplyHyperFlowH3Advanced": ApplyHyperFlowH3Advanced,
-                       "HyperFlowH3CurveFit": HyperFlowH3CurveFit}
+                       "HyperFlowH3CurveFit": HyperFlowH3CurveFit,
+                       "CompactLoraLoaderModelOnly": CompactLoraLoaderModelOnly,
+                       "ApplyBakedH3Curve": ApplyBakedH3Curve,
+                       "H3PresetSigmas": H3PresetSigmas}
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ApplyHyperFlowH3": "Apply HyperFlow H3 (MiniMax-H3 8-Step)",
     "ApplyHyperFlowH3Advanced": "Apply HyperFlow H3 Advanced (Ablations)",
-    "HyperFlowH3CurveFit": "Create HyperFlow H3 Curve Fit (Pruned Bases)"}
+    "HyperFlowH3CurveFit": "Create HyperFlow H3 Curve Fit (Pruned Bases)",
+    "CompactLoraLoaderModelOnly": "Load Compact LoRA (Model Only)",
+    "ApplyBakedH3Curve": "Restore Baked H3 HyperFlow Curve",
+    "H3PresetSigmas": "H3 Preset Sigmas"}

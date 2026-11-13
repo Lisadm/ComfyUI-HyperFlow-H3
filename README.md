@@ -1,5 +1,11 @@
 # ComfyUI-HyperFlow-H3
 
+This fork adds `ApplyBakedH3Curve` for baked H3 checkpoints and
+`CompactLoraLoaderModelOnly` for standard and diagonal QKV LoRAs. The baked
+curve node checks the fit file against the checkpoint's SHA-256 metadata before
+attaching it. The [optimized Timeline workflow](https://github.com/Lisadm/comfyui-obvpm-timeline)
+uses these nodes.
+
 An unofficial continuation of [Saganaki22/ComfyUI-Hyperflow](https://github.com/Saganaki22/ComfyUI-Hyperflow) (Apache-2.0), whose GitHub repository is no longer available. Changes from the original: per-block curve fits for pruned bases and hybrids, the Create HyperFlow H3 Curve Fit node, and renamed node IDs (`ApplyHyperFlowH3`, `ApplyHyperFlowH3Advanced`, `HyperFlowH3CurveFit`) so it installs alongside the original. Workflows made with the original nodes need those nodes swapped.
 
 [中文文档 (README_ZH)](README_ZH.md)

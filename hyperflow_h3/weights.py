@@ -301,6 +301,16 @@ def load_weights(path_or_name: str | os.PathLike) -> HyperFlowWeights:
             raise ValueError(f"Unknown HyperFlow fc1 layout: {fc1_layout!r}.")
         tensors = {key: handle.get_tensor(key) for key in keys}
 
+    qkv_storage = metadata.raw.get('qkv_storage')
+    if qkv_storage is not None:
+        if qkv_storage != 'diagonal_blocks_v1':
+            raise ValueError(f'Unsupported QKV storage: {qkv_storage}')
+        for key, tensor in tensors.items():
+            if key.endswith('attn.qkv_proj.lora_B.weight'):
+                if tensor.ndim != 3 or tensor.shape[0] != 3:
+                    raise ValueError(f'{key}: expected three diagonal blocks')
+                tensors[key] = torch.block_diag(*tensor.unbind(0))
+
     lora, endpoint, alphas = {}, {}, {}
     ranks = set()
     for target, entry in plan.items():

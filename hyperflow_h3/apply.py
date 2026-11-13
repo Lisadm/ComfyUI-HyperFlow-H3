@@ -44,8 +44,10 @@ class _FrugalLoRA(comfy.weight_adapter.LoRAAdapter):
         rank = down.shape[0]
         scale = (alpha / rank if alpha is not None else 1.0) \
             * getattr(self, "multiplier", 1.0)
-        down = down.to(dtype=x.dtype)
-        up = up.to(dtype=x.dtype)
+        if down.dtype != x.dtype:
+            down = down.to(dtype=x.dtype)
+        if up.dtype != x.dtype:
+            up = up.to(dtype=x.dtype)
         return base_out.add_(F.linear(F.linear(x, down), up), alpha=scale)
 
 
@@ -59,7 +61,9 @@ class _SplitQKVLoRA(comfy.weight_adapter.LoRAAdapter):
         width = up.shape[1]
         for i, (a, b) in enumerate(zip(down.chunk(3), up)):
             result = out[..., i * width:(i + 1) * width]
-            result.add_(F.linear(F.linear(x, a.to(dtype=x.dtype)), b.to(dtype=x.dtype)), alpha=scale)
+            a_t = a if a.dtype == x.dtype else a.to(dtype=x.dtype)
+            b_t = b if b.dtype == x.dtype else b.to(dtype=x.dtype)
+            result.add_(F.linear(F.linear(x, a_t), b_t), alpha=scale)
         return out
 
 

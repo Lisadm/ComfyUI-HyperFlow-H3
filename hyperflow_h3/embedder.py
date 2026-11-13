@@ -43,7 +43,7 @@ from comfy.ldm.minimax.model import (AUDIO_COND_TIMESTEP, VISUAL_COND_TIMESTEP,
                                      time_shift_sigma)
 from comfy.patcher_extension import WrappersMP
 
-from .schedule import video_schedule_sigmas
+from .schedule import is_trained_tail, video_schedule_sigmas
 
 _log = logging.getLogger("comfy.hyperflow")
 
@@ -80,13 +80,13 @@ def make_endpoint_forward(te, endpoint, alphas, cache):
         key = r.device
         hit = cache.get(key)
         if hit is None:
-            hit = tuple(t.to(device=r.device) for t in (a_in, b_in, a_out, b_out))
+            half = freq_dim // 2
+            freqs = torch.exp(-math.log(10000.0)
+                              * torch.arange(half, dtype=torch.float32, device=r.device) / half)
+            hit = (*(t.to(device=r.device) for t in (a_in, b_in, a_out, b_out)), freqs)
             cache[key] = hit
-        a_in_d, b_in_d, a_out_d, b_out_d = hit
+        a_in_d, b_in_d, a_out_d, b_out_d, freqs = hit
 
-        half = freq_dim // 2
-        freqs = torch.exp(-math.log(10000.0)
-                          * torch.arange(half, dtype=torch.float32, device=r.device) / half)
         args = r.to(torch.float32)[:, None] * freqs[None]
         emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         z = F.linear(emb, w_in, bias_in) + _lora_linear(emb, a_in_d, b_in_d,
@@ -135,6 +135,7 @@ def time_pairs(t_vals, shared):
                 pairs.append(pair)
             row_maps[kind][i] = pair_rows[pair]
     ctx["row_maps"] = row_maps
+    ctx["pairs"] = pairs
     ctx["tensor_row_maps"] = {}
     t = t_vals.new_tensor([pair[0] for pair in pairs])
     r = t_vals.new_tensor([pair[1] for pair in pairs])
@@ -178,8 +179,9 @@ def _remap_row(ctx, row, kind):
 def make_block_forward(base_forward, shared):
     def forward(x, t_emb, mod_segments, rope_freqs, *args, **kwargs):
         ctx = shared["ctx"]
-        if ctx.get("source_segments") is not mod_segments:
-            layout = ctx["transformer_options"]["minimax_h3_layout"]
+        options = kwargs.get("transformer_options", args[0] if args else ctx["transformer_options"])
+        layout = options["minimax_h3_layout"]
+        if ctx.get("source_segments") is not mod_segments or ctx.get("source_layout") is not layout:
             segments = iter(layout.segments)
             _, stop, kind = next(segments)
             remapped = []
@@ -190,6 +192,7 @@ def make_block_forward(base_forward, shared):
                 remapped.append((a, b, _remap_row(ctx, row // 3, stream) * 3 + row % 3))
             ctx["mod_segments"] = remapped
             ctx["source_segments"] = mod_segments
+            ctx["source_layout"] = layout
         return base_forward(x, t_emb, ctx["mod_segments"], rope_freqs, *args, **kwargs)
 
     forward._hyperflow_two_time = True
@@ -258,7 +261,7 @@ def make_ctx_wrapper(shared, dm, grid, label, verbose):
             if not warned["grid"]:
                 warned["grid"] = True
                 ss = sample_sigmas.flatten().cpu()
-                if ss.numel() != grid.numel() or not torch.allclose(ss, grid, atol=1e-4):
+                if not is_trained_tail(ss, grid):
                     _log.warning(
                         "[hyperflow] the sampler sigmas (%d points) are not the "
                         "trained 8-step grid; the adapter was distilled on its "
